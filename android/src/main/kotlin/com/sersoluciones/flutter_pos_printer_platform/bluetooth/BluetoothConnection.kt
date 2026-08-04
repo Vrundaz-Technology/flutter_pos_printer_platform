@@ -38,7 +38,8 @@ class BluetoothConnection constructor(handler: Handler) : IBluetoothConnection {
 
     // Member fields
     private val mAdapter: BluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
-    private val mHandler: Handler
+    @Volatile
+    private var mHandler: Handler
     private var mConnectThread: ConnectThread? = null
     private var mConnectedThread: ConnectedThread? = null
     private var mState: Int
@@ -48,6 +49,12 @@ class BluetoothConnection constructor(handler: Handler) : IBluetoothConnection {
      */
     init {
         mState = BluetoothConstants.STATE_NONE
+        mHandler = handler
+    }
+
+    /// See [IBluetoothConnection.setHandler]. Volatile because the connect and
+    /// connected threads read it off the main thread.
+    override fun setHandler(handler: Handler) {
         mHandler = handler
     }
 

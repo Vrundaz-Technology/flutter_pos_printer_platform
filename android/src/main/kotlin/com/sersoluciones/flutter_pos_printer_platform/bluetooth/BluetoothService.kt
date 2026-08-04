@@ -38,6 +38,22 @@ class BluetoothService(private var bluetoothHandler: Handler?) {
 
     fun setHandler(handler: Handler?) {
         bluetoothHandler = handler
+        // The live connection captured a handler when it was built and outlives
+        // the engine that built it, so redirect it too. Without this, the first
+        // engine to connect kept receiving every state change for the life of
+        // the link — including after it detached, at which point the events
+        // went nowhere and the surviving engine saw a connection that never
+        // reported a disconnect.
+        if (handler != null) bluetoothConnection?.setHandler(handler)
+    }
+
+    /// Release [handler] only if it is still the one in use.
+    ///
+    /// This object is a process-wide singleton shared by every attached engine.
+    /// An unconditional clear on detach let a short-lived background isolate
+    /// silence the events of a UI engine that was still running.
+    fun releaseHandler(handler: Handler) {
+        if (bluetoothHandler === handler) bluetoothHandler = null
     }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////

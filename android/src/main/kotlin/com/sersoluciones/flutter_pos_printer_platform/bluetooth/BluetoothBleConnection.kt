@@ -15,13 +15,21 @@ private const val TAG = "BluetoothBleConnection"
 
 class BluetoothBleConnection(
     private val mContext: Context,
-    private val mHandler: Handler,
+    handler: Handler,
     private var autoConnect: Boolean = false
 ) : IBluetoothConnection {
 
+    @Volatile
+    private var mHandler: Handler = handler
     private var bluetoothGatt: BluetoothGatt? = null
     private var mCharacteristic: BluetoothGattCharacteristic? = null
     private var mState: Int = BluetoothConstants.STATE_NONE
+
+    /// See [IBluetoothConnection.setHandler]. Volatile because the GATT
+    /// callbacks arrive on a binder thread.
+    override fun setHandler(handler: Handler) {
+        mHandler = handler
+    }
 
     /**
      * Return the current connection state.

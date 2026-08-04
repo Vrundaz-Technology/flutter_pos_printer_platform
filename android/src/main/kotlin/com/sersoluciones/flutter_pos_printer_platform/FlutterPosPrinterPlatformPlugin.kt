@@ -238,11 +238,14 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
         eventSink = null
         eventUSBSink = null
 
-        // Both are lateinit and both are assigned in onAttachedToEngine, but an
-        // engine that detached after a failed attach would otherwise take an
-        // UninitializedPropertyAccessException on the way out.
-        if (this::bluetoothService.isInitialized) bluetoothService.setHandler(null)
-        if (this::adapter.isInitialized) adapter.setHandler(null)
+        // Release rather than clear. Both services are process-wide singletons
+        // and more than one engine can be attached at once — a background print
+        // isolate alongside the live UI. Clearing unconditionally let whichever
+        // engine happened to detach first silence the other one's events. The
+        // isInitialized guards cover an engine that detaches after a failed
+        // attach, which would otherwise throw on the way out.
+        if (this::bluetoothService.isInitialized) bluetoothService.releaseHandler(bluetoothHandler)
+        if (this::adapter.isInitialized) adapter.releaseHandler(usbHandler)
     }
 
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {

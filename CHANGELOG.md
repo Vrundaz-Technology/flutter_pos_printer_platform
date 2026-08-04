@@ -13,6 +13,13 @@
   shown, so an engine with no Activity does not wedge every later connect.
 * Make USB init idempotent — the service is a process-wide singleton and each
   attached engine called it, registering the broadcast receiver more than once.
+* Redirect the live Bluetooth connection's handler along with the service's.
+  The connection captured a handler at construction and outlives the engine
+  that built it, so the first engine to connect owned every state change, read
+  and write failure for the life of the link — including after it detached,
+  when those events went nowhere.
+* Release handlers on engine detach only when they are still the ones in use,
+  so a short-lived background isolate cannot silence a running UI engine.
 
 ## 1.2.4
 

@@ -30,6 +30,15 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
         mHandler = handler
     }
 
+    /// Release [handler] only if it is still the one in use.
+    ///
+    /// This object is a process-wide singleton shared by every attached engine.
+    /// An unconditional clear on detach let a short-lived background isolate
+    /// silence the events of a UI engine that was still running.
+    fun releaseHandler(handler: Handler) {
+        if (mHandler === handler) mHandler = null
+    }
+
     private val mUsbDeviceReceiver: BroadcastReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val action = intent.action
