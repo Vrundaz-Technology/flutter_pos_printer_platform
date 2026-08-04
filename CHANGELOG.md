@@ -1,3 +1,19 @@
+## 1.2.5
+
+* Register the method and event channels on engine attach rather than activity
+  attach, so the plugin works in a Flutter engine that has no Activity — a
+  Firebase background message isolate, for instance. Previously such an isolate
+  raised `MissingPluginException: No implementation found for method listen on
+  channel com.sersoluciones.flutter_pos_printer_platform/bt_state`, and because
+  the same method channel backs `onStartConnection` and `printBytes`, printing
+  from the background was impossible.
+* Do not dereference a null Activity when Bluetooth permissions are missing;
+  report them as missing instead.
+* Only latch the enable-Bluetooth prompt flag once the prompt is actually
+  shown, so an engine with no Activity does not wedge every later connect.
+* Make USB init idempotent — the service is a process-wide singleton and each
+  attached engine called it, registering the broadcast receiver more than once.
+
 ## 1.2.4
 
 * Relax rxdart version to allow library usage in FlutterFlow app builder

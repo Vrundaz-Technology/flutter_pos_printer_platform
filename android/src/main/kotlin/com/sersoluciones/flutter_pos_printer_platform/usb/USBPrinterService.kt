@@ -23,6 +23,7 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
     private var mUsbDeviceConnection: UsbDeviceConnection? = null
     private var mUsbInterface: UsbInterface? = null
     private var mEndPoint: UsbEndpoint? = null
+    private var receiverRegistered: Boolean = false
     var state: Int = STATE_USB_NONE
 
     fun setHandler(handler: Handler?) {
@@ -68,6 +69,15 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
     }
 
     fun init(reactContext: Context?) {
+        // This is a process-wide singleton, and every Flutter engine attaching
+        // in that process calls init — the UI engine plus, since channels moved
+        // to onAttachedToEngine, any background message isolate. Registering
+        // the same receiver instance again would deliver each USB broadcast
+        // twice for as long as the process lived.
+        if (receiverRegistered) {
+            Log.v(LOG_TAG, "ESC/POS Printer already initialized")
+            return
+        }
         mContext = reactContext
         mUSBManager = mContext!!.getSystemService(Context.USB_SERVICE) as UsbManager
         mPermissionIndent = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
@@ -92,6 +102,7 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
         } else {
             mContext!!.registerReceiver(mUsbDeviceReceiver, filter)
         }
+        receiverRegistered = true
         Log.v(LOG_TAG, "ESC/POS Printer initialized")
     }
 

@@ -163,29 +163,24 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
 
 
 
+    // Channels and the printer services are bound to the *engine*, not the
+    // Activity. They used to be created in onAttachedToActivity, which meant
+    // any engine without an Activity — a Firebase background message isolate,
+    // a foreground-service isolate — had no channels at all. Dart there failed
+    // with `MissingPluginException: No implementation found for method listen
+    // on channel com.sersoluciones.flutter_pos_printer_platform/bt_state`, and
+    // since the same MethodChannel backs onStartConnection and printBytes,
+    // background printing over Bluetooth or USB could not work at all.
+    //
+    // Nothing set up here needs an Activity: the USB service takes an
+    // application Context, and BluetoothService only *stores* the Activity
+    // without using it. The genuinely Activity-bound work — permission
+    // requests, the enable-Bluetooth prompt, the result listeners — stays in
+    // onAttachedToActivity below.
     override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         Log.d(TAG, "onAttachedToEngine")
         binaryMessenger = flutterPluginBinding.binaryMessenger
-    }
-
-    override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
-        Log.d(TAG, "onDetachedFromEngine")
-        channel?.setMethodCallHandler(null)
-        messageChannel?.setStreamHandler(null)
-        messageUSBChannel?.setStreamHandler(null)
-
-        messageChannel = null
-        messageUSBChannel = null
-
-        bluetoothService.setHandler(null)
-        adapter.setHandler(null)
-    }
-
-    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
-        Log.d(TAG, "onAttachedToActivity")
-
-        context = binding.activity.applicationContext
-        currentActivity = binding.activity
+        context = flutterPluginBinding.applicationContext
 
         channel = MethodChannel(binaryMessenger!!, methodChannel)
         channel!!.setMethodCallHandler(this)
@@ -229,16 +224,41 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
             // the OS rejects, must not disable the rest of the plugin.
             Log.e(TAG, "USB printer init failed; USB printing unavailable", e)
         }
+    }
+
+    override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+        Log.d(TAG, "onDetachedFromEngine")
+        channel?.setMethodCallHandler(null)
+        messageChannel?.setStreamHandler(null)
+        messageUSBChannel?.setStreamHandler(null)
+
+        channel = null
+        messageChannel = null
+        messageUSBChannel = null
+        eventSink = null
+        eventUSBSink = null
+
+        // Both are lateinit and both are assigned in onAttachedToEngine, but an
+        // engine that detached after a failed attach would otherwise take an
+        // UninitializedPropertyAccessException on the way out.
+        if (this::bluetoothService.isInitialized) bluetoothService.setHandler(null)
+        if (this::adapter.isInitialized) adapter.setHandler(null)
+    }
+
+    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+        Log.d(TAG, "onAttachedToActivity")
+
+        currentActivity = binding.activity
 
         binding.addRequestPermissionsResultListener(this)
         binding.addActivityResultListener(this)
-        bluetoothService.setActivity(currentActivity)
+        if (this::bluetoothService.isInitialized) bluetoothService.setActivity(currentActivity)
     }
 
     override fun onDetachedFromActivityForConfigChanges() {
         Log.d(TAG, "onDetachedFromActivityForConfigChanges")
         currentActivity = null
-        bluetoothService.setActivity(null)
+        if (this::bluetoothService.isInitialized) bluetoothService.setActivity(null)
     }
 
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
@@ -246,13 +266,13 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
         currentActivity = binding.activity
         binding.addRequestPermissionsResultListener(this)
         binding.addActivityResultListener(this)
-        bluetoothService.setActivity(currentActivity)
+        if (this::bluetoothService.isInitialized) bluetoothService.setActivity(currentActivity)
     }
 
     override fun onDetachedFromActivity() {
         Log.d(TAG, "onDetachedFromActivity")
         currentActivity = null
-        bluetoothService.setActivity(null)
+        if (this::bluetoothService.isInitialized) bluetoothService.setActivity(null)
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
@@ -360,8 +380,13 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
             }
             if (!bluetoothService.mBluetoothAdapter.isEnabled) {
                 if (requestPermissionBT) return false
+                val activity = currentActivity ?: return false
                 val enableBtIntent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
-                currentActivity?.let { startActivityForResult(it, enableBtIntent, PERMISSION_ENABLE_BLUETOOTH, null) }
+                startActivityForResult(activity, enableBtIntent, PERMISSION_ENABLE_BLUETOOTH, null)
+                // Only latch this once the prompt is actually up. Setting it
+                // without an Activity left the flag stuck true — no activity
+                // result can ever clear it — and every later connect attempt
+                // in that engine short-circuited to false.
                 requestPermissionBT = true
                 return false
             }
@@ -438,8 +463,18 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
         }
 
         if (!hasPermissions(context, *permissions.toTypedArray())) {
-            Log.d(TAG, "")
-            ActivityCompat.requestPermissions(currentActivity!!, permissions.toTypedArray(), PERMISSION_ALL)
+            // Only an Activity can ask. In a background engine there is none,
+            // so report the permissions as missing rather than dereferencing a
+            // null Activity — the caller then fails the print cleanly instead
+            // of crashing the isolate. The user granted these in the UI when
+            // they first paired a printer; if they are missing here, the fix
+            // is in the app, not in a prompt nobody would see.
+            val activity = currentActivity
+            if (activity == null) {
+                Log.w(TAG, "Missing Bluetooth permissions and no Activity to request them")
+                return false
+            }
+            ActivityCompat.requestPermissions(activity, permissions.toTypedArray(), PERMISSION_ALL)
             return false
         }
         return true
