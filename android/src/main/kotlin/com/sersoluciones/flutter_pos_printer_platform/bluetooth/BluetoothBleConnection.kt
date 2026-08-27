@@ -10,8 +10,26 @@ import com.sersoluciones.flutter_pos_printer_platform.bluetooth.SampleGattAttrib
 import com.sersoluciones.flutter_pos_printer_platform.bluetooth.SampleGattAttributes.Companion.HEART_RATE_MEASUREMENT
 import io.flutter.plugin.common.MethodChannel
 import java.util.*
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 private const val TAG = "BluetoothBleConnection"
+
+/// Every BLE link starts here until a larger MTU is negotiated.
+private const val DEFAULT_ATT_MTU = 23
+
+/// ATT opcode + handle overhead on every write.
+private const val ATT_HEADER_BYTES = 3
+
+/// Largest MTU the spec allows; printers typically grant 185 or 247.
+private const val PREFERRED_ATT_MTU = 517
+
+/// Floor for the chunk size, so a bogus MTU can't produce zero-length writes.
+private const val MIN_CHUNK_BYTES = 20
+
+/// A chunk the stack never acknowledges. Generous: a busy printer can take a
+/// moment, but the print thread must not park on a dead link forever.
+private const val WRITE_TIMEOUT_MS = 5_000L
 
 class BluetoothBleConnection(
     private val mContext: Context,
@@ -24,6 +42,23 @@ class BluetoothBleConnection(
     private var bluetoothGatt: BluetoothGatt? = null
     private var mCharacteristic: BluetoothGattCharacteristic? = null
     private var mState: Int = BluetoothConstants.STATE_NONE
+
+    /// Payload capacity of one ATT write, learned from [onMtuChanged].
+    ///
+    /// Starts at the spec default every BLE link begins on. We ask for more
+    /// once services are discovered; if the printer refuses, 23 still works —
+    /// it just means more chunks, which is the difference between a slow
+    /// receipt and half a receipt.
+    @Volatile
+    private var negotiatedMtu: Int = DEFAULT_ATT_MTU
+
+    /// Released by [ResponseBluetoothGattCallback.onCharacteristicWrite] so
+    /// [write] can send the next chunk only once the stack has taken this one.
+    @Volatile
+    private var writeLatch: CountDownLatch? = null
+
+    @Volatile
+    private var lastWriteStatus: Int = BluetoothGatt.GATT_SUCCESS
 
     /// See [IBluetoothConnection.setHandler]. Volatile because the GATT
     /// callbacks arrive on a binder thread.
@@ -105,30 +140,121 @@ class BluetoothBleConnection(
             gatt.disconnect()
             gatt.close()
             bluetoothGatt = null
+            releasePendingWrite()
+            negotiatedMtu = DEFAULT_ATT_MTU
+            mCharacteristic = null
             state = BluetoothConstants.STATE_NONE
         }
     }
 
-    override fun write(out: ByteArray?) {
-        mCharacteristic?.let { characteristic ->
-//            val writeType = when {
-//                characteristic.isWritable() -> BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-//                characteristic.isWritableWithoutResponse() -> {
-//                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-//                }
-//                else -> error("Characteristic ${characteristic.uuid} cannot be written to")
-//            }
-
-            bluetoothGatt?.let { gatt ->
-                characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                characteristic.value = out
-                gatt.writeCharacteristic(mCharacteristic)
-                // Share the sent message back to the UI Activity
-                mHandler.obtainMessage(BluetoothConstants.MESSAGE_WRITE, -1, -1, out)
-                    .sendToTarget()
-            } ?: error("Not connected to a BLE device!")
-        }
+    /// Fail any chunk currently being waited on.
+    ///
+    /// Without this a print in flight when the link drops sits out the full
+    /// [WRITE_TIMEOUT_MS] for the chunk it is on — and the MTU from the dead
+    /// link would otherwise be reused to size chunks on the next one.
+    private fun releasePendingWrite() {
+        lastWriteStatus = BluetoothGatt.GATT_FAILURE
+        writeLatch?.countDown()
     }
+
+    /**
+     * Write [out] to the printer in ATT-sized chunks, waiting for each one to
+     * be acknowledged before sending the next.
+     *
+     * A single `writeCharacteristic` call carries at most ATT_MTU − 3 bytes.
+     * This method used to hand it the WHOLE receipt and return: the first
+     * ~182 bytes reached the printer, the remainder was discarded by the
+     * stack without an error, and the caller reported a successful print. On
+     * an 80mm ticket that is the restaurant name, address and phone — and
+     * nothing else, not even the cut, because the cut command sits at the end
+     * of the buffer that never went out.
+     *
+     * Blocks until the whole payload is acknowledged or a chunk fails. Callers
+     * must not run it on the main thread.
+     */
+    override fun write(out: ByteArray?): Boolean {
+        val payload = out ?: return false
+        if (payload.isEmpty()) return true
+
+        val characteristic = mCharacteristic ?: run {
+            Log.w(TAG, "write: no writable characteristic — not connected?")
+            return false
+        }
+        val gatt = bluetoothGatt ?: run {
+            Log.w(TAG, "write: not connected to a BLE device")
+            return false
+        }
+
+        // Prefer write-WITHOUT-response: receipt printers are sinks, they have
+        // nothing to say back, and acked writes roughly halve throughput. On
+        // Android the completion callback still fires for no-response writes —
+        // it is the stack's "buffer free again" signal — so it paces us either
+        // way. Fall back to an acked write if the characteristic demands one.
+        val writeType = if (characteristic.supportsWriteWithoutResponse()) {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        }
+
+        val chunkSize = (negotiatedMtu - ATT_HEADER_BYTES).coerceAtLeast(MIN_CHUNK_BYTES)
+        var offset = 0
+        var chunkIndex = 0
+
+        while (offset < payload.size) {
+            val end = minOf(offset + chunkSize, payload.size)
+            val chunk = payload.copyOfRange(offset, end)
+
+            writeLatch = CountDownLatch(1)
+            lastWriteStatus = BluetoothGatt.GATT_SUCCESS
+
+            characteristic.writeType = writeType
+            characteristic.value = chunk
+
+            val queued = gatt.writeCharacteristic(characteristic)
+            if (!queued) {
+                Log.e(TAG, "write: stack refused chunk $chunkIndex " +
+                    "(${chunk.size}B at offset $offset of ${payload.size}B)")
+                writeLatch = null
+                return false
+            }
+
+            // A chunk that is never acknowledged is worse than one that fails:
+            // without the timeout the print thread would park forever holding
+            // the printer.
+            val acked = try {
+                writeLatch?.await(WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS) ?: false
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                Log.w(TAG, "write: interrupted waiting for chunk $chunkIndex")
+                writeLatch = null
+                return false
+            }
+            writeLatch = null
+
+            if (!acked) {
+                Log.e(TAG, "write: chunk $chunkIndex timed out after ${WRITE_TIMEOUT_MS}ms " +
+                    "(${offset + chunk.size}/${payload.size} bytes sent)")
+                return false
+            }
+            if (lastWriteStatus != BluetoothGatt.GATT_SUCCESS) {
+                Log.e(TAG, "write: chunk $chunkIndex failed, status $lastWriteStatus " +
+                    "(${offset + chunk.size}/${payload.size} bytes sent)")
+                return false
+            }
+
+            offset = end
+            chunkIndex++
+        }
+
+        Log.d(TAG, "write: sent ${payload.size}B in $chunkIndex chunk(s) of up to ${chunkSize}B")
+        // Share the sent message back to the UI Activity
+        mHandler.obtainMessage(BluetoothConstants.MESSAGE_WRITE, -1, -1, payload)
+            .sendToTarget()
+        return true
+    }
+
+    private fun BluetoothGattCharacteristic.supportsWriteWithoutResponse(): Boolean =
+        properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
 
     /***
      *
@@ -166,6 +292,9 @@ class BluetoothBleConnection(
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.d(TAG, "onConnectionStateChange: STATE_DISCONNECTED")
+                    // Unblock a print that was mid-receipt when the link died.
+                    releasePendingWrite()
+                    negotiatedMtu = DEFAULT_ATT_MTU
                     if (mmChannelResult != null) {
                         // disconnected from the GATT Server
                         state = BluetoothConstants.STATE_FAILED
@@ -183,8 +312,25 @@ class BluetoothBleConnection(
             if (status == BluetoothGatt.GATT_SUCCESS) {
 
                 displayGattServices(getSupportedGattServices())
+                // Ask for the biggest ATT payload the printer will grant. A
+                // receipt is 700–1200 bytes; at the default MTU that is ~60
+                // round trips, and every one of them is a chance to stall.
+                // Best-effort — [onMtuChanged] records whatever we actually get.
+                if (gatt?.requestMtu(PREFERRED_ATT_MTU) != true) {
+                    Log.w(TAG, "requestMtu was refused; staying at $negotiatedMtu")
+                }
             } else {
                 Log.w(TAG, "onServicesDiscovered received: $status")
+            }
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
+            super.onMtuChanged(gatt, mtu, status)
+            if (status == BluetoothGatt.GATT_SUCCESS && mtu > 0) {
+                negotiatedMtu = mtu
+                Log.d(TAG, "ATT MTU negotiated: $mtu (${mtu - ATT_HEADER_BYTES}B per write)")
+            } else {
+                Log.w(TAG, "MTU negotiation failed (status $status); staying at $negotiatedMtu")
             }
         }
 
@@ -210,28 +356,24 @@ class BluetoothBleConnection(
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
-            with(characteristic) {
-                when (status) {
-                    BluetoothGatt.GATT_SUCCESS -> {
-                        Log.i(
-                            "BluetoothGattCallback",
-                            "Wrote to characteristic $uuid | value: $value"
-                        )
-                    }
-                    BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH -> {
-                        Log.e("BluetoothGattCallback", "Write exceeded connection ATT MTU!")
-                    }
-                    BluetoothGatt.GATT_WRITE_NOT_PERMITTED -> {
-                        Log.e("BluetoothGattCallback", "Write not permitted for $uuid!")
-                    }
-                    else -> {
-                        Log.e(
-                            "BluetoothGattCallback",
-                            "Characteristic write failed for $uuid, error: $status"
-                        )
-                    }
+            when (status) {
+                BluetoothGatt.GATT_SUCCESS -> {
+                    // Nothing to log per chunk — a receipt is dozens of them.
+                }
+                BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH -> {
+                    Log.e(TAG, "Write exceeded connection ATT MTU ($negotiatedMtu)!")
+                }
+                BluetoothGatt.GATT_WRITE_NOT_PERMITTED -> {
+                    Log.e(TAG, "Write not permitted for ${characteristic.uuid}!")
+                }
+                else -> {
+                    Log.e(TAG, "Chunk write failed for ${characteristic.uuid}, error: $status")
                 }
             }
+            // Record BEFORE releasing, so the waiting thread can't read a
+            // stale status through the gap.
+            lastWriteStatus = status
+            writeLatch?.countDown()
         }
     }
 

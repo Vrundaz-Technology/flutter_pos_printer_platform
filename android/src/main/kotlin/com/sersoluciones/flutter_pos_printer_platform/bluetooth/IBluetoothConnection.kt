@@ -5,7 +5,17 @@ import io.flutter.plugin.common.MethodChannel.Result
 interface IBluetoothConnection {
     fun connect(address: String, result: Result)
     fun stop()
-    fun write(out: ByteArray?)
+
+    /// Write [out] to the printer, returning whether ALL of it was accepted.
+    ///
+    /// The return value used to be nothing at all, and callers reported success
+    /// purely because a socket was open. On BLE that silently truncated every
+    /// receipt at one ATT MTU — the printer produced a header and stopped,
+    /// while the app logged a successful print.
+    ///
+    /// MAY BLOCK: the BLE implementation waits for each chunk to be
+    /// acknowledged. Call it off the main thread.
+    fun write(out: ByteArray?): Boolean
     var state: Int
 
     /// Redirect this connection's events to [handler].

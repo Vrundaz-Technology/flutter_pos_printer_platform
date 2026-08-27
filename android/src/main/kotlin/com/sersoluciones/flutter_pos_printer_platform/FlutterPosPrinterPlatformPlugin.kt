@@ -57,8 +57,17 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
     private var requestPermissionBT: Boolean = false
     private var isBle: Boolean = false
     private var isScan: Boolean = false
+
+    /// Set when the pending scan is the merged Classic+BLE sweep, so the
+    /// permission and enable-Bluetooth callbacks resume BOTH rather than
+    /// falling back to whichever one [isBle] happens to hold.
+    private var scanBoth: Boolean = false
     lateinit var adapter: USBPrinterService
     private lateinit var bluetoothService: BluetoothService
+
+    /// MethodChannel.Result must be answered on the main thread; sends now run
+    /// off it.
+    private val mainThreadHandler = Handler(Looper.getMainLooper())
 
 
 
@@ -278,8 +287,24 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
         if (this::bluetoothService.isInitialized) bluetoothService.setActivity(null)
     }
 
+    /// Re-run whichever scan was pending when we stopped to ask for a
+    /// permission or for Bluetooth to be switched on.
+    private fun resumePendingScan() {
+        val ch = channel ?: return
+        if (scanBoth) {
+            bluetoothService.cleanHandlerBtBle()
+            bluetoothService.scanBluDevice(ch)
+            bluetoothService.scanBleDevice(ch)
+        } else if (isBle) {
+            bluetoothService.scanBleDevice(ch)
+        } else {
+            bluetoothService.scanBluDevice(ch)
+        }
+    }
+
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
         isScan = false
+        scanBoth = false
         Log.d(TAG, "method call " + call.method.toString())
         when {
             call.method.equals("getBluetoothList") -> {
@@ -295,6 +320,25 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
                 isBle = true
                 isScan = true
                 if (verifyIsBluetoothIsOn()) {
+                    bluetoothService.scanBleDevice(channel!!)
+                    result.success(null)
+                }
+            }
+            // One list containing both transports, each entry tagged `isBle`.
+            // Exists so staff never have to know what "BLE" means: the app
+            // shows every printer it can see and picks the transport itself.
+            //
+            // Order matters. The bonded (Classic) sweep calls
+            // `cleanHandlerBtBle()`, which cancels pending callbacks on the BLE
+            // handler — running it second would kill the scan-stop timer the
+            // BLE sweep just posted and leave the radio scanning.
+            call.method.equals("getBluetoothAllList") -> {
+                isBle = true
+                isScan = true
+                scanBoth = true
+                if (verifyIsBluetoothIsOn()) {
+                    bluetoothService.cleanHandlerBtBle()
+                    bluetoothService.scanBluDevice(channel!!)
                     bluetoothService.scanBleDevice(channel!!)
                     result.success(null)
                 }
@@ -329,8 +373,19 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
                     val listInt: ArrayList<Int>? = call.argument("bytes")
                     val ints = listInt!!.toIntArray()
                     val bytes = ints.foldIndexed(ByteArray(ints.size)) { i, a, v -> a.apply { set(i, v.toByte()) } }
-                    val res = bluetoothService.sendDataByte(bytes)
-                    result.success(res)
+                    // Off the platform thread: a BLE send now waits for each
+                    // chunk to be acknowledged, and a whole receipt's worth of
+                    // those on the main thread is an ANR. `result` must still
+                    // be delivered on the main thread.
+                    Thread {
+                        val res = try {
+                            bluetoothService.sendDataByte(bytes)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "sendDataByte failed", e)
+                            false
+                        }
+                        mainThreadHandler.post { result.success(res) }
+                    }.start()
                 } else {
                     result.success(false)
                 }
@@ -502,7 +557,7 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
                 Log.d(TAG, "PERMISSION_ENABLE_BLUETOOTH PERMISSION_GRANTED resultCode $resultCode")
                 if (resultCode == Activity.RESULT_OK)
                     if (isScan)
-                        if (isBle) bluetoothService.scanBleDevice(channel!!) else bluetoothService.scanBluDevice(channel!!)
+                        resumePendingScan()
 
             }
         }
@@ -527,7 +582,7 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
                     Toast.makeText(context, R.string.not_permissions, Toast.LENGTH_LONG).show()
                 } else {
                     if (verifyIsBluetoothIsOn() && isScan)
-                        if (isBle) bluetoothService.scanBleDevice(channel!!) else bluetoothService.scanBluDevice(channel!!)
+                        resumePendingScan()
                 }
                 return true
             }

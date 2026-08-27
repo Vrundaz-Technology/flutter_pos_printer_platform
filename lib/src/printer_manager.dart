@@ -15,9 +15,14 @@ class PrinterManager {
 
   static PrinterManager get instance => _instance;
 
-  Stream<PrinterDevice> discovery({required PrinterType type, bool isBle = false, TcpPrinterInput? model}) {
+  /// Discover printers of [type].
+  ///
+  /// [both] applies to Bluetooth on Android only: one merged sweep returning
+  /// bonded Classic devices and BLE peripherals together, each tagged via
+  /// [PrinterDevice.isBle]. It overrides [isBle] when set.
+  Stream<PrinterDevice> discovery({required PrinterType type, bool isBle = false, bool both = false, TcpPrinterInput? model}) {
     if (type == PrinterType.bluetooth && (Platform.isIOS || Platform.isAndroid)) {
-      return bluetoothPrinterConnector.discovery(isBle: isBle);
+      return bluetoothPrinterConnector.discovery(isBle: isBle, both: both);
     } else if (type == PrinterType.usb && (Platform.isAndroid || Platform.isWindows)) {
       return usbPrinterConnector.discovery();
     } else {
