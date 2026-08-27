@@ -170,18 +170,17 @@ class BluetoothConnection constructor(handler: Handler) : IBluetoothConnection {
      * @param out The bytes to write
      * @see ConnectedThread.write
      */
-    override fun write(out: ByteArray?) {
+    override fun write(out: ByteArray?): Boolean {
+        if (out == null) return false
         // Create temporary object
-        var r: ConnectedThread?
+        val r: ConnectedThread?
         // Synchronize a copy of the ConnectedThread
         synchronized(this) {
-            if (mState != BluetoothConstants.STATE_CONNECTED) return
+            if (mState != BluetoothConstants.STATE_CONNECTED) return false
             r = mConnectedThread
         }
         // Perform the write unsynchronized
-        r!!.write(out)
-
-//        Log.d(BluetoothConnection.TAG, "envia: " + new String(out));
+        return r?.write(out) ?: false
     }
 
     /**
@@ -334,12 +333,18 @@ class BluetoothConnection constructor(handler: Handler) : IBluetoothConnection {
          *
          * @param bytes The bytes to write
          */
-        fun write(bytes: ByteArray?) {
-//            Log.d(TAG, "envia ConnectedThread MESSAGE_SEND_BT_CMD " + String(bytes!!))
+        /// Returns whether the bytes reached the socket. The caller reports
+        /// this to Flutter, so a swallowed IOException here used to surface as
+        /// a successful print.
+        fun write(bytes: ByteArray?): Boolean {
+            val stream = mmOutStream ?: return false
             try {
-                mmOutStream?.write(bytes)
+                stream.write(bytes)
+                // RFCOMM buffers; without the flush the tail of a receipt can
+                // sit in the stream while the caller reports it printed.
+                stream.flush()
             } catch (e: IOException) {
-//                Log.e(TAG, "Exception during write", e)
+                Log.e(TAG, "Exception during write", e)
                 // Send a failure message back to the activity.
                 val writeErrorMsg = mHandler.obtainMessage(BluetoothConstants.MESSAGE_TOAST)
                 val bundle = Bundle().apply {
@@ -347,12 +352,13 @@ class BluetoothConnection constructor(handler: Handler) : IBluetoothConnection {
                 }
                 writeErrorMsg.data = bundle
                 mHandler.sendMessage(writeErrorMsg)
-                return
+                return false
             }
 
             // Share the sent message back to the UI Activity
             val writtenMsg = mHandler.obtainMessage(BluetoothConstants.MESSAGE_WRITE, -1, -1, mmBuffer)
             writtenMsg.sendToTarget()
+            return true
         }
 
         fun cancel() {

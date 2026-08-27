@@ -71,6 +71,10 @@ class BluetoothService(private var bluetoothHandler: Handler?) {
             val deviceMap: HashMap<String?, String?> = HashMap()
             deviceMap["name"] = deviceName
             deviceMap["address"] = deviceHardwareAddress
+            // Tag the transport so a merged list can tell the two apart, and
+            // prefer this one: Classic streams a whole receipt, BLE has to
+            // chunk it.
+            deviceMap["isBle"] = "false"
             list.add(deviceMap)
             Log.d(TAG, "deviceName $deviceName deviceHardwareAddress $deviceHardwareAddress")
 
@@ -149,6 +153,7 @@ class BluetoothService(private var bluetoothHandler: Handler?) {
                 val deviceMap: HashMap<String?, String?> = HashMap()
                 deviceMap["name"] = deviceName
                 deviceMap["address"] = deviceHardwareAddress
+                deviceMap["isBle"] = "true"
                 if (result.device?.name != null)
                     mmChannel?.invokeMethod("ScanResult", deviceMap)
                 devicesBle.add(deviceBT)
@@ -220,12 +225,18 @@ class BluetoothService(private var bluetoothHandler: Handler?) {
         }
     }
 
+    /// Send [bytes] and report whether the printer actually took them.
+    ///
+    /// This used to return `true` for nothing more than an open socket, which
+    /// is how a BLE receipt truncated at one ATT MTU still logged as a
+    /// successful print — the tills showed green while the paper showed a
+    /// header and nothing else.
+    ///
+    /// MAY BLOCK (see [IBluetoothConnection.write]); call it off the main
+    /// thread.
     fun sendDataByte(bytes: ByteArray?): Boolean {
-        if (bluetoothConnection?.state == BluetoothConstants.STATE_CONNECTED) {
-            bluetoothConnection?.write(bytes!!)
-            return true
-        }
-        return false
+        if (bluetoothConnection?.state != BluetoothConstants.STATE_CONNECTED) return false
+        return bluetoothConnection?.write(bytes) ?: false
     }
 
     @Suppress("unused")

@@ -112,11 +112,19 @@ class BluetoothPrinterConnector implements PrinterConnector<BluetoothPrinterInpu
     return [];
   }
 
-  /// Starts a scan for Bluetooth Low Energy devices
-  /// Timeout closes the stream after a specified [Duration]
-  /// this device is low energy [isBle]
+  /// Starts a scan for Bluetooth devices.
+  ///
+  /// Timeout closes the stream after a specified [Duration].
+  ///
+  /// [isBle] picks the transport on Android: `false` lists bonded Classic
+  /// devices, `true` scans for BLE peripherals. Pass [both] to run one merged
+  /// sweep instead — every entry is then tagged via [PrinterDevice.isBle], and
+  /// a dual-mode printer seen on both is kept as its Classic entry. iOS is
+  /// always BLE (Apple reserves Classic serial for MFi accessories), so [isBle]
+  /// and [both] have no effect there.
   Stream<PrinterDevice> discovery({
     bool isBle = false,
+    bool both = false,
     Duration? timeout = const Duration(seconds: 7),
   }) async* {
     final killStreams = <Stream>[];
@@ -126,7 +134,13 @@ class BluetoothPrinterConnector implements PrinterConnector<BluetoothPrinterInpu
     _scanResults.add(<PrinterDevice>[]);
 
     if (Platform.isAndroid) {
-      isBle ? flutterPrinterChannel.invokeMethod('getBluetoothLeList') : flutterPrinterChannel.invokeMethod('getBluetoothList');
+      if (both) {
+        flutterPrinterChannel.invokeMethod('getBluetoothAllList');
+      } else if (isBle) {
+        flutterPrinterChannel.invokeMethod('getBluetoothLeList');
+      } else {
+        flutterPrinterChannel.invokeMethod('getBluetoothList');
+      }
 
       await for (dynamic data in _methodStream
           .where((m) => m.method == "ScanResult")
@@ -135,7 +149,15 @@ class BluetoothPrinterConnector implements PrinterConnector<BluetoothPrinterInpu
           // .takeUntil(TimerStream(3, Duration(seconds: 5)))
           .doOnDone(stopScan)
           .map((message) => message)) {
-        var device = PrinterDevice(name: data['name'] as String, address: data['address'] as String?);
+        // Native sends the tag as a string so the map stays HashMap<String?,
+        // String?>; older builds omit it, hence the fallback to the requested
+        // transport rather than a bare `false`.
+        final tagged = data['isBle'];
+        var device = PrinterDevice(
+          name: data['name'] as String,
+          address: data['address'] as String?,
+          isBle: tagged is String ? tagged == 'true' : (both ? null : isBle),
+        );
         if (!_addDevice(device)) continue;
         yield device;
       }
@@ -156,7 +178,13 @@ class BluetoothPrinterConnector implements PrinterConnector<BluetoothPrinterInpu
           .doOnDone(stopScan)
           .map((message) => message)) {
         print('Scan result: $data');
-        final device = PrinterDevice(name: data['name'] as String, address: data['address'] as String?);
+        // iOS has no Classic option for a generic printer — CoreBluetooth is
+        // BLE, and Classic serial needs an MFi accessory.
+        final device = PrinterDevice(
+          name: data['name'] as String,
+          address: data['address'] as String?,
+          isBle: true,
+        );
         if (!_addDevice(device)) continue;
         yield device;
       }
@@ -166,10 +194,21 @@ class BluetoothPrinterConnector implements PrinterConnector<BluetoothPrinterInpu
   bool _addDevice(PrinterDevice device) {
     bool isDeviceAdded = true;
     final list = _scanResults.value;
-    if (!list.any((e) => e.address == device.address))
+    final existingIndex = list.indexWhere((e) => e.address == device.address);
+    if (existingIndex < 0) {
       list.add(device);
-    else
+    } else {
+      // Dual-mode printers answer both sweeps on the same MAC. Keep the
+      // Classic entry: it carries a whole receipt in one stream, where BLE
+      // has to chunk it. The native side already emits Classic first, so this
+      // normally never fires — it is here so the preference does not silently
+      // depend on that ordering.
+      final existing = list[existingIndex];
+      if (existing.isBle == true && device.isBle == false) {
+        list[existingIndex] = device;
+      }
       isDeviceAdded = false;
+    }
     _scanResults.add(list);
     return isDeviceAdded;
   }
